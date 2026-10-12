@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
@@ -24,7 +25,7 @@ const (
 // 需要登录"的地方，所以中间件的接入点也放在这里，而不是让每个 handler
 // 自己判断要不要校验 token。
 
-func New(h *handler.Handler, jwtSecret string, log *zap.Logger, metricsHandler http.Handler) *gin.Engine {
+func New(h *handler.Handler, jwtSecret string, log *zap.Logger, metricsHandler http.Handler, rdb *redis.Client) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
@@ -35,7 +36,12 @@ func New(h *handler.Handler, jwtSecret string, log *zap.Logger, metricsHandler h
 	r.Use(middleware.HTTPMetrics())
 	// 限流是所有中间件里最外层的一道：比 JWT 验签更早执行才省钱，
 	// 且未登录接口（/auth/login）也受它保护。
-	r.Use(middleware.RateLimit(rateLimitPerSecond, rateLimitBurst))
+	// 有 Redis 用分布式版（多副本共享额度），没有则回落单机令牌桶。
+	if rdb != nil {
+		r.Use(middleware.RateLimitRedis(rdb, rateLimitPerSecond, rateLimitBurst))
+	} else {
+		r.Use(middleware.RateLimit(rateLimitPerSecond, rateLimitBurst))
+	}
 
 	r.GET("/healthz", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
