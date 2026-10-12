@@ -16,6 +16,7 @@ type Config struct {
 	MySQL         MySQLConfig         `mapstructure:"mysql"`
 	Redis         RedisConfig         `mapstructure:"redis"`
 	Elasticsearch ElasticsearchConfig `mapstructure:"elasticsearch"`
+	RocketMQ      RocketMQConfig      `mapstructure:"rocketmq"`
 	JWT           JWTConfig           `mapstructure:"jwt"`
 	Server        ServerConfig        `mapstructure:"server"`
 	GRPCClient    GRPCClientConfig    `mapstructure:"grpc_client"`
@@ -60,6 +61,12 @@ type RedisConfig struct {
 type ElasticsearchConfig struct {
 	Addr  string `mapstructure:"addr"`
 	Index string `mapstructure:"index"`
+}
+
+// RocketMQConfig 是 5.x gRPC 客户端的接入点。ProxyAddr 指 Proxy（默认
+// 8081），不是 NameServer（9876）——这是 5.x 客户端最常见的连接错误。
+type RocketMQConfig struct {
+	ProxyAddr string `mapstructure:"proxy_addr"`
 }
 
 type JWTConfig struct {

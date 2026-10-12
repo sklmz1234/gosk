@@ -21,3 +21,6 @@ data:
   # order-service 自己调 product-service 复用上面那条 PRODUCT_SERVICE_ADDR——
   # 同一份 ConfigMap 同时被两边 envFrom 引用，这是设计好的复用。
   GRPC_CLIENT_ORDER_SERVICE_ADDR: "order-service:9003"
+  # 消息中间件（阶段 6）：5.x gRPC 客户端连 Proxy 8081，Service 名即 DNS。
+  # order-service 的 relay 投递端与 product-service 的消费端都走这条。
+  ROCKETMQ_PROXY_ADDR: "rocketmq:8081"

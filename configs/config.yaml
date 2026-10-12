@@ -32,6 +32,13 @@ elasticsearch:
   addr: http://127.0.0.1:9200
   index: products
 
+# 消息中间件（阶段 6）。5.x gRPC 客户端连的是 Proxy（8081），不是
+# NameServer（9876）。容器环境里用 ROCKETMQ_PROXY_ADDR 覆盖成 service 名。
+# MQ 是投递通道不是正确性依赖：broker 故障时消息滞留 outbox 表退避重试，
+# 链路降级为"延迟变长"而不是"丢消息"。
+rocketmq:
+  proxy_addr: 127.0.0.1:8081
+
 # 开发环境用的默认 secret，生产环境务必通过 JWT_SECRET 环境变量覆盖
 
 jwt:

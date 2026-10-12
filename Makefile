@@ -6,7 +6,7 @@ K8S_DIR := deploy/k8s
 
 TAG ?= $(shell git rev-parse --short HEAD)
 
-.PHONY: help up down restart logs ps build seed clean k8s-build k8s-apply k8s-delete k8s-seed k8s-status k8s-rollout proto
+.PHONY: help up down restart logs ps build seed clean mq-up mq-dashboard k8s-build k8s-apply k8s-delete k8s-seed k8s-status k8s-rollout proto
 
 help: ## 显示本帮助
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-10s %s\n", $$1, $$2}'
@@ -40,6 +40,13 @@ seed: ## 灌入测试数据（10 用户 + 20 商品，用户密码均为 123456�
 
 clean: ## 停止并删除容器和数据卷（数据会清零，慎用）
 	$(COMPOSE) down -v
+
+mq-up: ## 只启动 RocketMQ 三件套（nameserver + broker + proxy）
+	$(COMPOSE) up -d rocketmq-nameserver rocketmq-broker rocketmq-proxy
+	@echo "--- proxy gRPC 入口: 127.0.0.1:8081 ---"
+
+mq-dashboard: ## 启动 RocketMQ 控制台（tools profile，http://localhost:18080）
+	$(COMPOSE) --profile tools up -d rocketmq-dashboard
 
 k8s-build: ## 构建全部镜像并打唯一 TAG（kind 集群经 containerd 镜像存储可直接使用）
 	TAG=$(TAG) $(COMPOSE) build
