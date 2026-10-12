@@ -20,7 +20,7 @@ import (
 func TestOrders_RequireAuth(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	h := handler.New(nil, zap.NewNop())
-	r := router.New(h, "test-secret", zap.NewNop(), nil)
+	r := router.New(h, "test-secret", zap.NewNop(), nil, nil)
 
 	tests := []struct {
 		name   string

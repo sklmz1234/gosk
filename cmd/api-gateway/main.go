@@ -16,6 +16,9 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.uber.org/zap"
 
+	"github.com/redis/go-redis/v9"
+
+	"go-ecom-admin/pkg/cache"
 	"go-ecom-admin/pkg/config"
 	"go-ecom-admin/pkg/logger"
 	"go-ecom-admin/pkg/telemetry"
@@ -90,7 +93,18 @@ func main() {
 
 	svc := service.New(userClient, productClient, orderClient)
 	h := handler.New(svc, log)
-	engine := router.New(h, cfg.JWT.Secret, log, metricsHandler)
+
+	// 分布式限流的 Redis（可选依赖）：连不上时传 nil，路由层回落单机
+	// 令牌桶——与 product-service 的缓存降级同一原则，加速层不是正确性依赖。
+	var rdb *redis.Client
+	if client, err := cache.New(cache.Config{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB}); err != nil {
+		log.Warn("redis unavailable, falling back to standalone rate limiter", zap.Error(err))
+	} else {
+		defer client.Close()
+		rdb = client
+	}
+
+	engine := router.New(h, cfg.JWT.Secret, log, metricsHandler, rdb)
 
 	addr := fmt.Sprintf(":%d", cfg.Server.APIGateway.HTTPPort)
 	httpServer := &http.Server{
