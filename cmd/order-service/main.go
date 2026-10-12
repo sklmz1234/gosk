@@ -32,10 +32,12 @@ import (
 	"go-ecom-admin/pkg/logger"
 	"go-ecom-admin/pkg/telemetry"
 
+	"go-ecom-admin/internal/order/consumer"
 	"go-ecom-admin/internal/order/model"
 	"go-ecom-admin/internal/order/outbox"
 	"go-ecom-admin/internal/order/repository"
 	"go-ecom-admin/internal/order/service"
+	"go-ecom-admin/pkg/mq"
 	orderpb "go-ecom-admin/proto/order"
 )
 
@@ -111,9 +113,48 @@ func main() {
 
 	svc := service.New(repo, outboxRepo, productClient, log)
 
-	// outbox relay
-	relay := outbox.NewRelay(outboxRepo, productClient, log, 0, 0)
-	go relay.Run(ctx)
+	// ── MQ 接线（Phase 1b + 2）────────────────────────────────────────
+	// publisher 是 relay 的"船"：outbox 表里的消息（stock.restore 回补 +
+	// order.timeout 定时关单）经它上 RocketMQ。声明要发的两个 topic。
+	// broker 不可用时降级：relay 不启动，消息滞留 outbox 表，broker 恢复
+	// 后重启进程自愈——MQ 是投递通道不是正确性依赖。
+	var publisher mq.Publisher
+	if cfg.RocketMQ.ProxyAddr != "" {
+		publisher, err = mq.NewPublisher(cfg.RocketMQ.ProxyAddr, mq.TopicStockRestore, mq.TopicOrderTimeout)
+		if err != nil {
+			log.Warn("rocketmq publisher unavailable, outbox messages stay pending until restart",
+				zap.String("endpoint", cfg.RocketMQ.ProxyAddr), zap.Error(err))
+		}
+	}
+
+	if publisher != nil {
+		// relay：本地消息表 → RocketMQ。
+		relay := outbox.NewRelay(outboxRepo, publisher, log, 0, 0)
+		go relay.Run(ctx)
+
+		// 超时关单消费者：消费 order-timeout topic，对 15 分钟未支付的
+		// 订单做系统取消（复用 CancelWithOutbox，回补消息走同一条
+		// relay 链路）。broker 不可用时这里 Start 已经失败不了——
+		// publisher 活着说明 proxy 可达；若消费组连接仍失败，降级为
+		// 超时关单暂不可用，订单停在 PENDING 等人工，不影响其他功能。
+		timeoutConsumer, cerr := mq.NewConsumer(cfg.RocketMQ.ProxyAddr, mq.GroupOrderTimeout, 0, mq.TopicOrderTimeout)
+		if cerr != nil {
+			log.Warn("rocketmq timeout consumer unavailable, order auto-cancel disabled",
+				zap.String("endpoint", cfg.RocketMQ.ProxyAddr), zap.Error(cerr))
+		} else {
+			go func() {
+				if err := timeoutConsumer.Run(ctx, consumer.NewTimeoutConsumer(repo, outboxRepo, log).Handle); err != nil {
+					log.Error("order timeout consumer stopped", zap.Error(err))
+				}
+			}()
+			defer timeoutConsumer.Close()
+		}
+		defer func() {
+			if err := publisher.Close(); err != nil {
+				log.Error("publisher close", zap.Error(err))
+			}
+		}()
+	}
 
 	// 服务端埋点。
 	grpcServer := grpc.NewServer(grpc.StatsHandler(otelgrpc.NewServerHandler()))

@@ -30,11 +30,24 @@ func NewGormRepository(db *gorm.DB) Repository {
 	return &gormRepository{db: db}
 }
 
+// Create 在一个事务里落订单 + 写支付超时定时消息（outbox 模式）。
+// 超时消息与订单同生同死：订单落库成功才可能需要"15 分钟后关单"，
+// 分开写会出现"订单在、超时消息丢"的漏关单窗口。Create 保持无返回
+// 副作用的旧签名，调用方（service）不需要知道这条消息的存在。
 func (r *gormRepository) Create(ctx context.Context, o *model.Order) error {
-	if err := r.db.WithContext(ctx).Create(o).Error; err != nil {
-		return apperrors.Internal("failed to create order", err)
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(o).Error; err != nil {
+			return apperrors.Internal("failed to create order", err)
+		}
+		msg, err := model.TimeoutMessageFor(o)
+		if err != nil {
+			return apperrors.Internal("failed to encode timeout message", err)
+		}
+		if err := tx.Create(msg).Error; err != nil {
+			return apperrors.Internal("failed to create timeout outbox message", err)
+		}
+		return nil
+	})
 }
 
 func (r *gormRepository) GetByID(ctx context.Context, id uint64) (*model.Order, error) {
