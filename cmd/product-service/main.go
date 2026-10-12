@@ -118,7 +118,7 @@ func main() {
 		log.Warn("redis unavailable, product cache disabled (falling back to direct MySQL)", zap.Error(err))
 	} else {
 		defer rdb.Close()
-		repo = repository.NewCachedRepository(repo, rdb)
+		repo = repository.NewCachedRepository(repo, rdb, repository.NewStockGate(rdb))
 		log.Info("product cache enabled", zap.String("redis", cfg.Redis.Addr))
 	}
 

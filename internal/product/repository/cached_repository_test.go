@@ -82,7 +82,7 @@ func setup(t *testing.T, next Repository) (*cachedRepository, *miniredis.Minired
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	repo := NewCachedRepository(next, rdb)
+	repo := NewCachedRepository(next, rdb, NewStockGate(rdb))
 	cached, ok := repo.(*cachedRepository)
 	require.True(t, ok, "NewCachedRepository should return *cachedRepository")
 	return cached, mr
