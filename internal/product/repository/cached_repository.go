@@ -36,12 +36,15 @@ type cachedRepository struct {
 	next Repository // 被装饰的下一层（gorm 实现），命名 next 强调"调用链"语义
 	rdb  *redis.Client
 
+	// gate 库存前置闸门：扣减请求先过 Lua 原子预检，见 stock_gate.go。
+	gate *StockGate
+
 	sf singleflight.Group
 }
 
 // NewCachedRepository 用 Redis 包装一个已有 Repository，返回的仍是 Repository 接口。
-func NewCachedRepository(next Repository, rdb *redis.Client) Repository {
-	return &cachedRepository{next: next, rdb: rdb}
+func NewCachedRepository(next Repository, rdb *redis.Client, gate *StockGate) Repository {
+	return &cachedRepository{next: next, rdb: rdb, gate: gate}
 }
 
 func productKey(id uint64) string {
@@ -131,10 +134,21 @@ func (r *cachedRepository) ListByIDs(ctx context.Context, ids []uint64) ([]*mode
 }
 
 func (r *cachedRepository) DeductStock(ctx context.Context, productID uint64, quantity int32) (*model.Product, error) {
+	// 前置闸门：库存明显不足的请求在这里被拦掉，微秒级，不碰 InnoDB 行锁。
+	// Redis 故障（err != nil）→ 放行降级，DB 条件更新兜底。
+	if allowed, err := r.gate.TryDeduct(ctx, productID, quantity); err == nil && !allowed {
+		return nil, apperrors.FailedPrecondition("insufficient stock", nil)
+	}
+
 	p, err := r.next.DeductStock(ctx, productID, quantity)
 	if err != nil {
+		// 闸门可能已预扣但 DB 失败：不回滚闸门——代价是闸门短暂偏低（少卖），
+		// 下次成功落库后的 Sync 会用 DB 真值纠偏。宁可少卖，不可超卖。
 		return nil, err
 	}
+	// 对账式回写：预热 + 纠偏一体，见 StockGate.Sync 的注释。
+	_ = r.gate.Sync(ctx, productID, p.Stock)
+
 	if err := r.rdb.Del(ctx, productKey(productID)).Err(); err != nil {
 		return nil, apperrors.Internal("failed to invalidate product cache", err)
 	}
@@ -146,6 +160,9 @@ func (r *cachedRepository) RestoreStock(ctx context.Context, productID uint64, q
 	if err != nil {
 		return nil, err
 	}
+	// 回补后闸门同步变大，理由同 DeductStock 的 Sync。
+	_ = r.gate.Sync(ctx, productID, p.Stock)
+
 	if err := r.rdb.Del(ctx, productKey(productID)).Err(); err != nil {
 		return nil, apperrors.Internal("failed to invalidate product cache", err)
 	}
@@ -158,6 +175,8 @@ func (r *cachedRepository) RestoreStockIdempotent(ctx context.Context, messageID
 	if err != nil {
 		return nil, err
 	}
+	_ = r.gate.Sync(ctx, productID, p.Stock)
+
 	if err := r.rdb.Del(ctx, productKey(productID)).Err(); err != nil {
 		return nil, apperrors.Internal("failed to invalidate product cache", err)
 	}
