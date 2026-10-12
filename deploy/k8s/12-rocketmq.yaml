@@ -39,6 +39,11 @@ spec:
       labels:
         app: rocketmq
     spec:
+      # 镜像以非 root（uid 3000）运行，emptyDir 默认 root:root 不可写——
+      # fsGroup 让 kubelet 把卷的组改为 3000，broker 才能写 store（compose
+      # 侧的等价问题用 user: "0:0" 解决，见 docker-compose.yml 注释）。
+      securityContext:
+        fsGroup: 3000
       containers:
         - name: nameserver
           image: apache/rocketmq:5.3.2
