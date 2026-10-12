@@ -118,8 +118,14 @@ func main() {
 		log.Warn("redis unavailable, product cache disabled (falling back to direct MySQL)", zap.Error(err))
 	} else {
 		defer rdb.Close()
-		repo = repository.NewCachedRepository(repo, rdb, repository.NewStockGate(rdb))
+		bloom := cache.NewBloomFilter(rdb, "bloom:product", 100000, 0.01)
+		repo = repository.NewCachedRepository(repo, rdb, repository.NewStockGate(rdb), bloom)
 		log.Info("product cache enabled", zap.String("redis", cfg.Redis.Addr))
+
+		// 后台预热布隆过滤器：bloom 的 key 一旦丢失（FlushDB/重启清库），
+		// "一定不存在"的判定会把所有真实商品误拦 404——启动重建是
+		// 最低成本的对账。预热失败只降级（穿透由空值缓存兜底），不阻塞启动。
+		go preloadBloom(repo, bloom, log)
 	}
 
 	svc := service.New(repo, log)
@@ -188,4 +194,33 @@ func main() {
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatal("grpc server stopped with error", zap.Error(err))
 	}
+}
+
+// preloadBloom 后台把存量商品 id 全量灌进布隆过滤器（启动对账）。
+// 失败只降级——穿透防护退回空值缓存兜底，不影响服务可用性。
+func preloadBloom(repo repository.Repository, bloom *cache.BloomFilter, log *zap.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	loaded := 0
+	for page := 1; ; page++ {
+		products, _, err := repo.List(ctx, page, 500)
+		if err != nil {
+			log.Warn("bloom preload failed, penetration protection degraded to null caching",
+				zap.Error(err), zap.Int("loaded", loaded))
+			return
+		}
+		for _, p := range products {
+			if err := bloom.Add(ctx, p.ID); err != nil {
+				log.Warn("bloom preload add failed, penetration protection degraded to null caching",
+					zap.Error(err), zap.Int("loaded", loaded))
+				return
+			}
+			loaded++
+		}
+		if len(products) < 500 {
+			break
+		}
+	}
+	log.Info("bloom filter preloaded", zap.Int("products", loaded))
 }

@@ -15,6 +15,8 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
+	"github.com/redis/go-redis/v9"
+
 	"go-ecom-admin/pkg/cache"
 	"go-ecom-admin/pkg/config"
 	"go-ecom-admin/pkg/database"
@@ -152,16 +154,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	rdb, err := cache.New(cache.Config{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
-	if err != nil {
-		// 清缓存是卫生措施不是核心职责，Redis 连不上只警告不中断
-		// （比如本地裸跑 seed 而 Redis 没起时，库表重置仍然有用）。
+	// 清缓存是卫生措施不是核心职责，Redis 连不上只警告不中断
+	// （比如本地裸跑 seed 而 Redis 没起时，库表重置仍然有用）。
+	// rdb 保持打开到函数结束：商品灌完后还要用它重建布隆过滤器。
+	var rdb *redis.Client
+	if client, err := cache.New(cache.Config{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB}); err != nil {
 		fmt.Fprintf(os.Stderr, "warn: connect redis, cache not flushed: %v\n", err)
 	} else {
+		rdb = client
+		defer func() { _ = rdb.Close() }()
 		if err := rdb.FlushDB(context.Background()).Err(); err != nil {
 			fmt.Fprintf(os.Stderr, "warn: flush redis: %v\n", err)
 		}
-		_ = rdb.Close()
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(seedPassword), bcrypt.DefaultCost)
@@ -201,6 +205,22 @@ func main() {
 	if err := db.Create(&products).Error; err != nil {
 		fmt.Fprintf(os.Stderr, "insert products: %v\n", err)
 		os.Exit(1)
+	}
+
+	// 布隆过滤器随种子数据重建：上面 FlushDB 已清场，直接把新 id 全量
+	// 灌入即可（不需要先 DEL）。否则商品详情的布隆闸门会把所有种子
+	// 商品判成"一定不存在"，详情页全部 404。
+	if rdb != nil {
+		bloom := cache.NewBloomFilter(rdb, "bloom:product", 100000, 0.01)
+		added := 0
+		for _, p := range products {
+			if err := bloom.Add(context.Background(), p.ID); err != nil {
+				fmt.Fprintf(os.Stderr, "warn: bloom add product id=%d: %v\n", p.ID, err)
+				continue
+			}
+			added++
+		}
+		fmt.Printf("bloom filter: %d/%d products added\n", added, len(products))
 	}
 
 	// 收货信息池

@@ -15,6 +15,7 @@ import (
 	apperrors "go-ecom-admin/pkg/errors"
 
 	"go-ecom-admin/internal/product/model"
+	"go-ecom-admin/pkg/cache"
 )
 
 // countingRepo 是手写假实现而不是 mockery mock：缓存装饰器的测试核心是
@@ -82,10 +83,19 @@ func setup(t *testing.T, next Repository) (*cachedRepository, *miniredis.Minired
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	repo := NewCachedRepository(next, rdb, NewStockGate(rdb))
+	repo := NewCachedRepository(next, rdb, NewStockGate(rdb), cache.NewBloomFilter(rdb, "bloom:product", 1000, 0.01))
 	cached, ok := repo.(*cachedRepository)
 	require.True(t, ok, "NewCachedRepository should return *cachedRepository")
 	return cached, mr
+}
+
+// mustBloomAdd 把 id 加进布隆过滤器——GetByID 的第一道闸会拦截"一定不存在"
+// 的 id，期望回源的用例必须先放行。
+func mustBloomAdd(t *testing.T, repo *cachedRepository, ids ...uint64) {
+	t.Helper()
+	for _, id := range ids {
+		require.NoError(t, repo.bloom.Add(context.Background(), id))
+	}
 }
 
 var testProduct = &model.Product{ID: 42, Name: "机械键盘", PriceCents: 19900, Stock: 10}
@@ -95,6 +105,7 @@ func TestCachedRepository_GetByID_MissThenHit(t *testing.T) {
 	next := &countingRepo{product: testProduct}
 	repo, _ := setup(t, next)
 	ctx := context.Background()
+	mustBloomAdd(t, repo, 42)
 
 	p1, err := repo.GetByID(ctx, 42)
 	require.NoError(t, err)
@@ -112,6 +123,7 @@ func TestCachedRepository_GetByID_TTLHasJitter(t *testing.T) {
 	next := &countingRepo{product: testProduct}
 	repo, mr := setup(t, next)
 	ctx := context.Background()
+	mustBloomAdd(t, repo, 42)
 
 	_, err := repo.GetByID(ctx, 42)
 	require.NoError(t, err)
@@ -126,6 +138,8 @@ func TestCachedRepository_GetByID_NullCaching(t *testing.T) {
 	next := &countingRepo{product: nil} // 回源永远 NotFound
 	repo, mr := setup(t, next)
 	ctx := context.Background()
+	// 999 加进布隆模拟"误判放行"（或历史上存在过）——空值缓存兜的就是这一路
+	mustBloomAdd(t, repo, 999)
 
 	_, err := repo.GetByID(ctx, 999)
 	require.Error(t, err)
@@ -148,6 +162,7 @@ func TestCachedRepository_Update_InvalidatesCache(t *testing.T) {
 	next := &countingRepo{product: testProduct}
 	repo, mr := setup(t, next)
 	ctx := context.Background()
+	mustBloomAdd(t, repo, 42)
 
 	_, err := repo.GetByID(ctx, 42) // 让缓存里先有旧值
 	require.NoError(t, err)
@@ -163,6 +178,7 @@ func TestCachedRepository_Delete_InvalidatesCache(t *testing.T) {
 	next := &countingRepo{product: testProduct}
 	repo, mr := setup(t, next)
 	ctx := context.Background()
+	mustBloomAdd(t, repo, 42)
 
 	_, err := repo.GetByID(ctx, 42)
 	require.NoError(t, err)
@@ -179,6 +195,7 @@ func TestCachedRepository_DeductStock_InvalidatesCache(t *testing.T) {
 	next := &countingRepo{product: testProduct}
 	repo, mr := setup(t, next)
 	ctx := context.Background()
+	mustBloomAdd(t, repo, 42)
 
 	_, err := repo.GetByID(ctx, 42) // 让缓存里先有旧值
 	require.NoError(t, err)
@@ -194,6 +211,7 @@ func TestCachedRepository_RestoreStock_InvalidatesCache(t *testing.T) {
 	next := &countingRepo{product: testProduct}
 	repo, mr := setup(t, next)
 	ctx := context.Background()
+	mustBloomAdd(t, repo, 42)
 
 	_, err := repo.GetByID(ctx, 42)
 	require.NoError(t, err)
@@ -212,6 +230,7 @@ func TestCachedRepository_GetByID_Singleflight(t *testing.T) {
 	next := &countingRepo{product: testProduct, delay: 100 * time.Millisecond}
 	repo, _ := setup(t, next)
 	ctx := context.Background()
+	mustBloomAdd(t, repo, 42)
 
 	const concurrency = 20
 	var wg sync.WaitGroup
@@ -246,4 +265,33 @@ func TestCachedRepository_RedisDown_FallbackToDB(t *testing.T) {
 	require.NoError(t, err, "Redis 挂了应该降级直连 DB，而不是整个读路径挂掉")
 	assert.Equal(t, testProduct.Name, p.Name)
 	assert.Equal(t, int32(1), next.getCalls.Load())
+}
+
+// 布隆过滤器第一道闸：未 Add 的 id 判"一定不存在"，直接 NotFound，
+// 缓存和 DB 都不碰（回源计数为 0）。
+func TestCachedRepository_GetByID_BloomRejectsUnknown(t *testing.T) {
+	next := &countingRepo{product: testProduct}
+	repo, _ := setup(t, next)
+
+	_, err := repo.GetByID(context.Background(), 999)
+	require.Error(t, err)
+	assert.True(t, isNotFound(err))
+	assert.Equal(t, int32(0), next.getCalls.Load(), "被布隆拦截的请求不应回源")
+}
+
+// Create 成功后新 id 立即加入布隆——否则它的详情请求会被第一道闸误拦。
+func TestCachedRepository_Create_AddsToBloom(t *testing.T) {
+	next := &countingRepo{product: testProduct}
+	repo, _ := setup(t, next)
+	ctx := context.Background()
+
+	ok, err := repo.bloom.MightContain(ctx, 42)
+	require.NoError(t, err)
+	assert.False(t, ok, "Create 前 id 不应在布隆里")
+
+	require.NoError(t, repo.Create(ctx, testProduct))
+
+	ok, err = repo.bloom.MightContain(ctx, 42)
+	require.NoError(t, err)
+	assert.True(t, ok, "Create 后 id 应在布隆里")
 }

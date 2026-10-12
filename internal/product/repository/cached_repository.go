@@ -14,6 +14,7 @@ import (
 	apperrors "go-ecom-admin/pkg/errors"
 
 	"go-ecom-admin/internal/product/model"
+	"go-ecom-admin/pkg/cache"
 )
 
 const (
@@ -39,12 +40,16 @@ type cachedRepository struct {
 	// gate 库存前置闸门：扣减请求先过 Lua 原子预检，见 stock_gate.go。
 	gate *StockGate
 
+	// bloom 防穿透第一道闸："一定不存在"的 id 在碰缓存/DB 之前就被拒掉，
+	// 见 pkg/cache/bloom.go。误判只会放行，由空值缓存兜底。
+	bloom *cache.BloomFilter
+
 	sf singleflight.Group
 }
 
 // NewCachedRepository 用 Redis 包装一个已有 Repository，返回的仍是 Repository 接口。
-func NewCachedRepository(next Repository, rdb *redis.Client, gate *StockGate) Repository {
-	return &cachedRepository{next: next, rdb: rdb, gate: gate}
+func NewCachedRepository(next Repository, rdb *redis.Client, gate *StockGate, bloom *cache.BloomFilter) Repository {
+	return &cachedRepository{next: next, rdb: rdb, gate: gate, bloom: bloom}
 }
 
 func productKey(id uint64) string {
@@ -57,6 +62,12 @@ func jitteredTTL(base, jitter time.Duration) time.Duration {
 }
 
 func (r *cachedRepository) GetByID(ctx context.Context, id uint64) (*model.Product, error) {
+	// 布隆过滤器第一道：判"一定不存在"直接 NotFound，缓存和 DB 都不碰。
+	// Redis 故障（err != nil）→ 放行降级，同缓存层的降级原则。
+	if ok, err := r.bloom.MightContain(ctx, id); err == nil && !ok {
+		return nil, apperrors.NotFound("product not found", nil)
+	}
+
 	key := productKey(id)
 
 	cached, err := r.rdb.Get(ctx, key).Result()
@@ -96,9 +107,14 @@ func (r *cachedRepository) GetByID(ctx context.Context, id uint64) (*model.Produ
 	return v.(*model.Product), nil
 }
 
-// Create 直接透传
+// Create 直接透传，成功后把新 id 加入布隆过滤器——否则它的详情请求
+// 会被第一道闸判成"一定不存在"而误拦（零假阴性只保证 Add 过的 id）。
 func (r *cachedRepository) Create(ctx context.Context, p *model.Product) error {
-	return r.next.Create(ctx, p)
+	if err := r.next.Create(ctx, p); err != nil {
+		return err
+	}
+	_ = r.bloom.Add(ctx, p.ID)
+	return nil
 }
 
 func (r *cachedRepository) Update(ctx context.Context, p *model.Product) error {
