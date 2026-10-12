@@ -5,10 +5,7 @@ package service
 
 import (
 	"context"
-	"encoding/json"
-	"time"
 
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	apperrors "go-ecom-admin/pkg/errors"
@@ -185,25 +182,9 @@ func (s *Service) CancelOrder(ctx context.Context, req *orderpb.CancelOrderReque
 	}
 
 	// 每个订单项组装一条回补消息（FIFO 投递，逐项对应扣减记录）。
-	messages := make([]*model.OutboxMessage, 0, len(o.Items))
-	for _, it := range o.Items {
-		payload, err := json.Marshal(model.StockRestorePayload{
-			ProductID: it.ProductID,
-			Quantity:  it.Quantity,
-			OrderID:   o.ID,
-		})
-		if err != nil {
-			// json.Marshal 一个纯数字字段结构体实际不会失败，防御性兜底。
-			return nil, apperrors.ToGRPCStatus(apperrors.Internal("failed to encode outbox payload", err))
-		}
-		messages = append(messages, &model.OutboxMessage{
-			MessageID:   uuid.NewString(),
-			Type:        model.OutboxTypeStockRestore,
-			Payload:     string(payload),
-			Status:      model.OutboxStatusPending,
-			NextRetryAt: time.Now(),
-		})
-	}
+	// 构造逻辑收敛到 model.StockRestoreMessagesFor：手动取消和超时
+	// 自动关单（consumer/order_timeout.go）两条路径共用同一份。
+	messages := model.StockRestoreMessagesFor(o)
 
 	// 一个事务：条件迁移状态（WHERE status='PENDING'）+ 批量写消息。
 	// 并发取消只有一个能命中；不命中的整体回滚，返回 409。

@@ -1,6 +1,6 @@
 // Package outbox 承载本地消息表的投递端：一个内嵌在 order-service 里的
-// relay goroutine，周期性扫描 outbox_messages 把到期的消息投递给
-// product-service。
+// relay goroutine，周期性扫描 outbox_messages，把到期的消息通过
+// mq.Publisher 发到 RocketMQ（Phase 1b：投递通道从 gRPC 直连换成 MQ）。
 
 package outbox
 
@@ -18,7 +18,7 @@ import (
 
 	"go-ecom-admin/internal/order/model"
 	"go-ecom-admin/internal/order/repository"
-	"go-ecom-admin/pkg/identity"
+	"go-ecom-admin/pkg/mq"
 )
 
 const (
@@ -32,7 +32,7 @@ const (
 
 type Relay struct {
 	outbox    repository.OutboxRepository
-	products  repository.ProductClient
+	publisher mq.Publisher
 	log       *zap.Logger
 	tracer    trace.Tracer
 	interval  time.Duration
@@ -44,7 +44,9 @@ type Relay struct {
 }
 
 // NewRelay 组装 relay。interval/batchSize 传 0 用默认值。
-func NewRelay(outbox repository.OutboxRepository, products repository.ProductClient, log *zap.Logger, interval time.Duration, batchSize int) *Relay {
+// 依赖是 mq.Publisher 接口而不是具体 RocketMQ 客户端——单测注入
+// fake，未来换 MQ 实现不动这里。
+func NewRelay(outbox repository.OutboxRepository, publisher mq.Publisher, log *zap.Logger, interval time.Duration, batchSize int) *Relay {
 	if interval <= 0 {
 		interval = DefaultInterval
 	}
@@ -60,7 +62,7 @@ func NewRelay(outbox repository.OutboxRepository, products repository.ProductCli
 
 	return &Relay{
 		outbox:    outbox,
-		products:  products,
+		publisher: publisher,
 		log:       log,
 		tracer:    otel.GetTracerProvider().Tracer("go-ecom-admin/order/outbox"),
 		interval:  interval,
@@ -121,6 +123,12 @@ func (r *Relay) tick(ctx context.Context) {
 
 // deliver 投递单条消息。成功 MarkSent；失败 MarkFailed（退避/死信在
 // session 里算好，dead=true 时补 ERROR 日志）。
+//
+// Phase 1b 后投递目标从"product 的 gRPC RestoreStock"变成"RocketMQ 的
+// topic"：relay 不再知道消息的业务含义（也不再反解 payload 成
+// StockRestorePayload），只负责把 Envelope 原样上船。业务解码移到
+// 消费端（product/consumer/stock_restore.go），投递端与消费端通过
+// Envelope 的 type 字段解耦——这是"管道与内容分离"的落点。
 func (r *Relay) deliver(ctx context.Context, sess *repository.OutboxSession, m *model.OutboxMessage) {
 	ctx, span := r.tracer.Start(ctx, "outbox-relay.deliver",
 		trace.WithAttributes(
@@ -130,15 +138,17 @@ func (r *Relay) deliver(ctx context.Context, sess *repository.OutboxSession, m *
 		))
 	defer span.End()
 
-	var p model.StockRestorePayload
-	if err := json.Unmarshal([]byte(m.Payload), &p); err != nil {
-		// 消息体损坏是永久性失败：重试一万次也不会好，
-		// 直接死信（MarkDead 跳过退避），别浪费重试窗口。
-		r.log.Error("OUTBOX DEAD: undecodable payload",
-			zap.Uint64("outbox_id", m.ID), zap.String("message_id", m.MessageID), zap.Error(err))
-		span.SetStatus(codes.Error, "undecodable payload")
+	// 永久性失败就地死信，不上 MQ：
+	// 1. payload 不是合法 JSON——消费端必然解析失败，重试无意义；
+	// 2. 未知消息类型——没有对应的 topic 可投（typo 场景），发布即丢失。
+	topic, known := mq.TopicForType(m.Type)
+	if !json.Valid([]byte(m.Payload)) || !known {
+		r.log.Error("OUTBOX DEAD: undeliverable message",
+			zap.Uint64("outbox_id", m.ID), zap.String("message_id", m.MessageID),
+			zap.String("type", m.Type), zap.String("topic", topic))
+		span.SetStatus(codes.Error, "undeliverable message")
 		if err := sess.MarkDead(ctx, m.ID); err != nil {
-			r.log.Error("mark dead after undecodable payload", zap.Error(err))
+			r.log.Error("mark dead after undeliverable message", zap.Error(err))
 		}
 		if r.dead != nil {
 			r.dead.Add(ctx, 1)
@@ -146,8 +156,42 @@ func (r *Relay) deliver(ctx context.Context, sess *repository.OutboxSession, m *
 		return
 	}
 
+	// 组 Envelope 上船：MessageID 贯穿 outbox 表、MQ、消费端幂等表，
+	// 是全链路对账与去重的唯一键。Key=MessageID 方便按消息查轨迹，
+	// Tag=Type 方便消费端按类型过滤。
+	env, err := json.Marshal(mq.Envelope{
+		MessageID: m.MessageID,
+		Type:      m.Type,
+		Payload:   json.RawMessage(m.Payload),
+	})
+	if err != nil {
+		r.log.Error("OUTBOX DEAD: failed to encode envelope",
+			zap.Uint64("outbox_id", m.ID), zap.String("message_id", m.MessageID), zap.Error(err))
+		span.SetStatus(codes.Error, "envelope encode failed")
+		if err := sess.MarkDead(ctx, m.ID); err != nil {
+			r.log.Error("mark dead after envelope encode failed", zap.Error(err))
+		}
+		if r.dead != nil {
+			r.dead.Add(ctx, 1)
+		}
+		return
+	}
+
+	msg := mq.Message{
+		Topic: topic,
+		Key:   m.MessageID,
+		Tag:   m.Type,
+		Body:  env,
+	}
+	if m.DeliverAt != nil {
+		// 定时消息（order.timeout）：RocketMQ 5.x timer wheel 秒级定时，
+		// 到点前对消费者不可见。relay 扫到即发，延迟由 broker 承担——
+		// 这比"relay 自己等 15 分钟再投"省了扫描周期内的额外误差。
+		msg.DeliverAt = *m.DeliverAt
+	}
+
 	callCtx, cancel := context.WithTimeout(ctx, deliverTimeout)
-	err := r.products.RestoreStock(identity.InjectOutgoingSystem(callCtx), p.ProductID, p.Quantity, m.MessageID)
+	err = r.publisher.Send(callCtx, msg)
 	cancel()
 	if err == nil {
 		if err := sess.MarkSent(ctx, m.ID); err != nil {
@@ -171,14 +215,12 @@ func (r *Relay) deliver(ctx context.Context, sess *repository.OutboxSession, m *
 	span.SetStatus(codes.Error, err.Error())
 
 	if dead {
-		// 死信：重试耗尽。到这里说明 product 侧持续故障（如商品已删除），
-		// 自动投递放弃，换人工/重放工具处置（4b）。
+		// 死信：重试耗尽（broker 长时间不可用等）。MQ 是投递通道不是
+		// 正确性依赖，消息仍在 outbox 表里标 DEAD，可人工重放。
 		r.log.Error("OUTBOX DEAD: delivery exhausted, manual action required",
 			zap.Uint64("outbox_id", m.ID),
 			zap.String("message_id", m.MessageID),
-			zap.Uint64("product_id", p.ProductID),
-			zap.Int32("quantity", p.Quantity),
-			zap.Uint64("order_id", p.OrderID),
+			zap.String("type", m.Type),
 			zap.Int("retries", m.RetryCount+1),
 			zap.Error(err),
 		)
@@ -190,6 +232,7 @@ func (r *Relay) deliver(ctx context.Context, sess *repository.OutboxSession, m *
 	r.log.Warn("outbox delivery failed, will retry with backoff",
 		zap.Uint64("outbox_id", m.ID),
 		zap.String("message_id", m.MessageID),
+		zap.String("type", m.Type),
 		zap.Int("retry_count", m.RetryCount+1),
 		zap.Error(err),
 	)

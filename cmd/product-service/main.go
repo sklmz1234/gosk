@@ -31,9 +31,11 @@ import (
 	"go-ecom-admin/pkg/logger"
 	"go-ecom-admin/pkg/telemetry"
 
+	"go-ecom-admin/internal/product/consumer"
 	"go-ecom-admin/internal/product/model"
 	"go-ecom-admin/internal/product/repository"
 	"go-ecom-admin/internal/product/service"
+	"go-ecom-admin/pkg/mq"
 	productpb "go-ecom-admin/proto/product"
 )
 
@@ -131,6 +133,27 @@ func main() {
 	svc := service.New(repo, log)
 
 	cartSvc := service.NewCartService(repo, repository.NewGormCartRepository(db), log)
+
+	// ── MQ 接线（Phase 1b）：stock-restore 消费者 ────────────────────
+	// 消费取消订单的回补消息，走 RestoreStockIdempotent 幂等加回库存。
+	// repo 是含 cache/bloom/ES 装饰器的整条链：RestoreStockIdempotent
+	// 会穿透装饰器直达 gorm 层（回补后缓存失效由 cachedRepository 处理）。
+	// broker 不可用时降级：消费者不启动，消息滞留 broker（invisible
+	// 到期不断重投），进程重启后从断点续消——不 Fatal。
+	if cfg.RocketMQ.ProxyAddr != "" {
+		stockConsumer, err := mq.NewConsumer(cfg.RocketMQ.ProxyAddr, mq.GroupStockRestore, 0, mq.TopicStockRestore)
+		if err != nil {
+			log.Warn("rocketmq stock-restore consumer unavailable, messages stay in broker until restart",
+				zap.String("endpoint", cfg.RocketMQ.ProxyAddr), zap.Error(err))
+		} else {
+			go func() {
+				if err := stockConsumer.Run(ctx, consumer.NewStockRestoreConsumer(repo, log).Handle); err != nil {
+					log.Error("stock-restore consumer stopped", zap.Error(err))
+				}
+			}()
+			defer stockConsumer.Close()
+		}
+	}
 
 	// 服务端埋点：提取上游 trace 上下文 + 每轮 RPC 建服务端 span。
 	grpcServer := grpc.NewServer(grpc.StatsHandler(otelgrpc.NewServerHandler()))

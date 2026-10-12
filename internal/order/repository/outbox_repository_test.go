@@ -4,6 +4,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -59,7 +60,8 @@ func TestCancelWithOutbox_Atomicity(t *testing.T) {
 	}
 	require.NoError(t, h.repo.CancelWithOutbox(ctx, order.ID, model.StatusPending, model.StatusCancelled, msgs))
 
-	// 状态已迁移 + 两条消息都在（同一事务的两种写都生效）。
+	// 状态已迁移 + 消息都在（同一事务的两种写都生效）：
+	// repo.Create 写入的 order.timeout 定时消息 + 取消写入的两条回补。
 	o, err := h.repo.GetByID(ctx, order.ID)
 	require.NoError(t, err)
 	assert.Equal(t, model.StatusCancelled, o.Status)
@@ -67,8 +69,11 @@ func TestCancelWithOutbox_Atomicity(t *testing.T) {
 	sess, err := h.repo.ClaimPending(ctx, 10)
 	require.NoError(t, err)
 	require.NotNil(t, sess)
-	assert.Len(t, sess.Messages, 2)
-	assert.Equal(t, "m-1", sess.Messages[0].MessageID, "按 id 升序 FIFO")
+	require.Len(t, sess.Messages, 3)
+	assert.Equal(t, model.OutboxTypeOrderTimeout, sess.Messages[0].Type, "Create 先写的超时消息排最前")
+	require.NotNil(t, sess.Messages[0].DeliverAt, "下单即写入的定时消息必须带 DeliverAt")
+	assert.Equal(t, "m-1", sess.Messages[1].MessageID, "按 id 升序 FIFO")
+	assert.Equal(t, "m-2", sess.Messages[2].MessageID)
 	// 显式及时关闭：单测的 sqlite 连接池锁成单连接（见 newSQLiteDB 注释），
 	// session 持有事务期间其他 repo 调用会等连接——不留 defer 到函数尾。
 	require.NoError(t, sess.Close())
@@ -80,7 +85,33 @@ func TestCancelWithOutbox_Atomicity(t *testing.T) {
 
 	n, err := h.repo.CountPending(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, int64(2), n, "迁移失败的批次一条消息都不能落库")
+	assert.Equal(t, int64(3), n, "迁移失败的批次一条消息都不能落库（已有的 3 条不受影响）")
+}
+
+// Create 必须和支付超时消息"同生共死"：订单落库成功的同时写入
+// order.timeout 定时消息（DeliverAt = CreatedAt + 15min）。
+// 漏写 = 永远不会触发自动关单（静默漏关单）。
+func TestCreate_WritesTimeoutMessage(t *testing.T) {
+	h := newOutboxDB(t)
+	ctx := context.Background()
+
+	before := time.Now()
+	order := &model.Order{UserID: 42, Status: model.StatusPending}
+	require.NoError(t, h.repo.Create(ctx, order))
+
+	var msgs []model.OutboxMessage
+	require.NoError(t, h.db.Where("type = ?", model.OutboxTypeOrderTimeout).Find(&msgs).Error)
+	require.Len(t, msgs, 1, "Create 恰好写一条超时消息")
+
+	m := msgs[0]
+	assert.Equal(t, model.OutboxStatusPending, m.Status)
+	require.NotNil(t, m.DeliverAt)
+	assert.WithinDuration(t, before.Add(model.OrderTimeoutDelay), *m.DeliverAt, time.Minute,
+		"投递时刻 = 下单时刻 + 15 分钟")
+
+	var p model.OrderTimeoutPayload
+	require.NoError(t, json.Unmarshal([]byte(m.Payload), &p))
+	assert.Equal(t, order.ID, p.OrderID)
 }
 
 // MarkFailed 的退避计算：每次失败 retry_count+1、next_retry_at 按指数推远。

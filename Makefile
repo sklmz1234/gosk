@@ -45,6 +45,10 @@ mq-up: ## 只启动 RocketMQ 三件套（nameserver + broker + proxy）
 	$(COMPOSE) up -d rocketmq-nameserver rocketmq-broker rocketmq-proxy
 	@echo "--- proxy gRPC 入口: 127.0.0.1:8081 ---"
 
+mq-topics: ## 创建业务 topic（stock-restore / order-timeout）。幂等：已存在则提示重复，无副作用
+	$(COMPOSE) exec rocketmq-broker sh mqadmin updateTopic -n rocketmq-nameserver:9876 -t stock-restore -c DefaultCluster
+	$(COMPOSE) exec rocketmq-broker sh mqadmin updateTopic -n rocketmq-nameserver:9876 -t order-timeout -c DefaultCluster
+
 mq-dashboard: ## 启动 RocketMQ 控制台（tools profile，http://localhost:18080）
 	$(COMPOSE) --profile tools up -d rocketmq-dashboard
 

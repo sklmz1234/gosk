@@ -25,7 +25,8 @@ func newSQLiteDB(t *testing.T) *gorm.DB {
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, db.AutoMigrate(&model.Order{}, &model.OrderItem{}))
+	// OutboxMessage 必须一起建：repo.Create 在同事务写 order.timeout 消息。
+	require.NoError(t, db.AutoMigrate(&model.Order{}, &model.OrderItem{}, &model.OutboxMessage{}))
 	return db
 }
 
