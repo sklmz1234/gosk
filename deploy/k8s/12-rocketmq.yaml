@@ -1,0 +1,122 @@
+# RocketMQ（阶段 6）：order-service 事件驱动的消息中间件。
+#
+# 形态：单副本一个 Pod 塞三个容器——NameServer（路由发现）、Broker
+# （存储投递）、Proxy（5.x gRPC 客户端接入层）。三者在 Pod 内共享网络
+# 命名空间，broker 用 localhost:9876 注册，客户端只暴露 Proxy 的 8081。
+# 存储用 emptyDir：本地教学集群形态，Pod 重建消息清零（与 Prometheus
+# 不挂数据卷同一取舍；生产必须 PVC + 主备/Controller 高可用）。
+#
+# 堆参数已压到最小——默认 JVM 堆在本地 kind 集群里会挤爆其他组件
+# （同 compose 里对 ES 的取舍）。资源 limit 比堆略高：JVM 的实际 RSS
+# = 堆 + 元空间 + 直接内存缓冲，limit 卡在堆大小会被 OOMKilled。
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: rocketmq
+  namespace: ecom
+spec:
+  selector:
+    app: rocketmq
+  ports:
+    # 5.x gRPC 客户端（rocketmq-clients/golang）唯一入口
+    - name: proxy
+      port: 8081
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rocketmq
+  namespace: ecom
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rocketmq
+  template:
+    metadata:
+      labels:
+        app: rocketmq
+    spec:
+      # 镜像以非 root（uid 3000）运行，emptyDir 默认 root:root 不可写——
+      # fsGroup 让 kubelet 把卷的组改为 3000，broker 才能写 store（compose
+      # 侧的等价问题用 user: "0:0" 解决，见 docker-compose.yml 注释）。
+      securityContext:
+        fsGroup: 3000
+      containers:
+        - name: nameserver
+          image: apache/rocketmq:5.3.2
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "mqnamesrv"]
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: JAVA_OPT_EXT
+              value: "-Xms256m -Xmx256m"
+          ports:
+            - name: namesrv
+              containerPort: 9876
+          readinessProbe:
+            tcpSocket:
+              port: 9876
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 384Mi }
+
+        - name: broker
+          image: apache/rocketmq:5.3.2
+          imagePullPolicy: IfNotPresent
+          # 单 Pod 内 nameserver 就在 localhost，注册地址零配置
+          command: ["sh", "mqbroker", "-n", "localhost:9876"]
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: JAVA_OPT_EXT
+              value: "-Xms512m -Xmx512m"
+          ports:
+            - name: broker
+              containerPort: 10911
+          readinessProbe:
+            tcpSocket:
+              port: 10911
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          volumeMounts:
+            - name: store
+              mountPath: /home/rocketmq/store
+          resources:
+            requests: { cpu: 100m, memory: 512Mi }
+            limits: { memory: 768Mi }
+
+        - name: proxy
+          image: apache/rocketmq:5.3.2
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "mqproxy"]
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: JAVA_OPT_EXT
+              value: "-Xms256m -Xmx256m"
+            - name: NAMESRV_ADDR
+              value: localhost:9876
+          ports:
+            - name: proxy
+              containerPort: 8081
+          readinessProbe:
+            tcpSocket:
+              port: 8081
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 384Mi }
+
+      volumes:
+        - name: store
+          emptyDir: {}

@@ -78,6 +78,76 @@ services:
       retries: 12
       start_period: 60s
 
+  # 消息中间件（阶段 6）：RocketMQ 5.x 官方推荐的三容器形态——
+  # NameServer（路由发现）+ Broker（存储投递）+ Proxy（5.x gRPC 客户端
+  # 的统一接入层）。Go SDK 连的是 proxy:8081，不是 NameServer:9876。
+  # 单节点开发形态，堆参数压到最小（默认堆会在 Windows Docker Desktop
+  # 上和 ES 两个 Java 大户互相挤爆，同 elasticsearch 的取舍）。
+  rocketmq-nameserver:
+    image: apache/rocketmq:5.3.2
+    environment:
+      TZ: Asia/Shanghai
+      JAVA_OPT_EXT: "-Xms256m -Xmx256m"
+    command: sh mqnamesrv
+    restart: unless-stopped
+
+  rocketmq-broker:
+    image: apache/rocketmq:5.3.2
+    # 镜像默认以非 root（uid 3000）运行，而命名卷由 Docker 以 root 创建，
+    # broker 写 store/lock 直接 Permission denied（2026-10-12 实测踩坑：
+    # 官方 quickstart 不给 broker 挂卷所以没这问题）。本地开发形态以 root
+    # 运行，与 mysql/redis/es 容器同一姿态；K8s 侧用 fsGroup 正规解决。
+    user: "0:0"
+    environment:
+      TZ: Asia/Shanghai
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m"
+    command: sh mqbroker -n rocketmq-nameserver:9876
+    # 同 mysql/redis/es：daemon 重启后自愈；store 挂卷防 recreate 丢消息。
+    restart: unless-stopped
+    volumes:
+      - rocketmq-data:/home/rocketmq/store
+    depends_on:
+      - rocketmq-nameserver
+    healthcheck:
+      # 向 NameServer 查集群路由：能查到 broker 说明注册成功，
+      # 这比探端口强——broker 起了但没注册上时探针也能过。
+      test: ["CMD-SHELL", "sh mqadmin clusterList -n rocketmq-nameserver:9876 >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # gRPC 接入层：5.x 客户端（rocketmq-clients/golang）只和它说话，
+  # 由它翻译给内部的 remoting 协议。8081 同时映射到宿主机——
+  # 宿主机裸 go run 的进程走 127.0.0.1:8081（config.yaml 默认值）。
+  rocketmq-proxy:
+    image: apache/rocketmq:5.3.2
+    environment:
+      TZ: Asia/Shanghai
+      JAVA_OPT_EXT: "-Xms256m -Xmx256m"
+      NAMESRV_ADDR: rocketmq-nameserver:9876
+    command: sh mqproxy
+    restart: unless-stopped
+    ports:
+      - "${ROCKETMQ_PROXY_HOST_PORT:-8081}:8081"
+    depends_on:
+      - rocketmq-broker
+
+  # RocketMQ 控制台（可选，不随 make up 启动，用 make mq-up 后单独
+  # `docker compose --profile tools up -d rocketmq-dashboard`）。看 topic/
+  # 消息轨迹/DLQ 用，面试演示利器。8080 被网关占了，宿主机端口用 18080。
+  rocketmq-dashboard:
+    image: apacherocketmq/rocketmq-dashboard:latest
+    profiles: ["tools"]
+    environment:
+      TZ: Asia/Shanghai
+      JAVA_OPTS: "-Drocketmq.namesrv.addr=rocketmq-nameserver:9876"
+    ports:
+      - "${ROCKETMQ_DASHBOARD_HOST_PORT:-18080}:8080"
+    depends_on:
+      - rocketmq-nameserver
+    restart: unless-stopped
+
   user-service:
     build:
       context: .
@@ -106,6 +176,8 @@ services:
       REDIS_ADDR: redis:6379
       # 搜索引擎地址（阶段 5A），覆盖 config.yaml 里的 http://127.0.0.1:9200
       ELASTICSEARCH_ADDR: http://elasticsearch:9200
+      # 消息中间件 Proxy 地址（阶段 6）。容器网络内用 service 名寻址。
+      ROCKETMQ_PROXY_ADDR: rocketmq-proxy:8081
       TELEMETRY_OTLP_ENDPOINT: jaeger:4317
       TZ: Asia/Shanghai
     depends_on:
@@ -131,6 +203,9 @@ services:
       # order-service 是 gRPC 客户端（调 product-service 扣库存），
       # 容器网络内用 service 名寻址。
       GRPC_CLIENT_PRODUCT_SERVICE_ADDR: product-service:9002
+      # 消息中间件 Proxy 地址（阶段 6）：outbox relay 的投递端 +
+      # 订单超时自消费都走它。
+      ROCKETMQ_PROXY_ADDR: rocketmq-proxy:8081
       TELEMETRY_OTLP_ENDPOINT: jaeger:4317
       TZ: Asia/Shanghai
     depends_on:
@@ -253,3 +328,4 @@ volumes:
   mysql-data:
   redis-data:
   es-data:
+  rocketmq-data:
